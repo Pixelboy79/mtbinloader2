@@ -186,49 +186,70 @@ fn process_material(man: AssetManager, data: &[u8]) -> Option<Vec<u8>> {
 
     None
 }
-fn handle_lightmaps(materialbin: &mut CompiledMaterialDefinition) {
-    let finder = Finder::new(b"void main");
-    // very bad code please help
-    // let finder1 = Finder::new(b"v_lightmapUV = a_texcoord1;");
-    // let finder2 = Finder::new(b"v_lightmapUV=a_texcoord1;");
-    let finder1 = Finder::new("0.066666670143604278564453125");
-    //    let finder2 = Finder::new("1.0/15.0");
-    let finder3 = Finder::new(b"#define a_texcoord1 ");
-    //     let replace_with = b"
-    // #define a_texcoord1 vec2(fract(a_texcoord1.x*15.9375)+0.0001,floor(a_texcoord1.x*15.9375)*0.0625+0.0001)
-    // void main";
-    let replace_with = b"
-#define a_texcoord1 clamp(vec2( \
-float(uint(round(a_texcoord1.y * 65535.0)) >> 4u), \
-float(uint(round(a_texcoord1.y * 65535.0)) & 15u) \
-)* 0.066666, 0.0, 1.0)
-    void main";
-    for (_, pass) in &mut materialbin.passes {
-        for variants in &mut pass.variants {
-            for (stage, code) in &mut variants.shader_codes {
-                if stage.stage == ShaderStage::Vertex {
-                    let blob = &mut code.bgfx_shader_data;
-                    let Ok(mut bgfx) = blob.pread::<BgfxShader>(0) else {
-                        continue;
-                    };
-                    if finder1.find(&bgfx.code).is_some() || finder3.find(&bgfx.code).is_some() {
-                        continue;
-                    }
-                    // if finder3.find(&bgfx.code).is_some()
-                    //     || (finder1.find(&bgfx.code).is_none()
-                    //         && finder2.find(&bgfx.code).is_none())
-                    // {
-                    //     continue;
-                    // };
-                    replace_bytes(&mut bgfx.code, &finder, b"void main", replace_with);
+fn handle_lightmaps(material: &mut CompiledMaterialDefinition) {
+    let finder_pack = Finder::new(b"a_texcoord1 * 65535.0");
+    let finder_uv1  = Finder::new(b"vec2 uv1");
 
-                    blob.clear();
-                    let _unused = bgfx.write(blob);
+    // Mojang 1.21.130 unpack logic
+    let unpack_code = b"
+    uvec2 _6d79f = uvec2(round(a_texcoord1 * 65535.0));
+    uvec2 _5e4ed = _6d79f;
+    vec2 uv1 = vec2(
+        uvec2(_5e4ed.y >> 4u, _5e4ed.y) & uvec2(15u,15u)
+    ) * vec2_splat(0.066666670143604278564453125);
+    ";
+
+    for (_, pass) in &mut material.passes {
+        for variant in &mut pass.variants {
+            for (stage, code) in &mut variant.shader_codes {
+                if stage.stage != ShaderStage::Vertex {
+                    continue;
                 }
+
+                let blob = &mut code.bgfx_shader_data;
+                let Ok(mut bgfx) = blob.pread::<BgfxShader>(0) else {
+                    continue;
+                };
+
+                let src = &bgfx.code;
+
+                // must be 1.21.130 packed shader
+                if finder_pack.find(src).is_none() {
+                    continue;
+                }
+
+                // prevent double patch
+                if finder_uv1.find(src).is_some() {
+                    continue;
+                }
+
+                // inject after `void main() {`
+                if let Some(main_pos) = memchr::memmem::find(src, b"void main") {
+                    if let Some(brace_pos) =
+                        src[main_pos..].iter().position(|&c| c == b'{')
+                    {
+                        let insert_at = main_pos + brace_pos + 1;
+                        bgfx.code.splice(
+                            insert_at..insert_at,
+                            unpack_code.iter().cloned(),
+                        );
+                    }
+                }
+
+                // IMPORTANT: replace assignment, NOT attribute
+                bgfx.code = bgfx.code
+                    .replace(b"v_lightmapUV = a_texcoord1;", b"v_lightmapUV = uv1;")
+                    .replace(b"v_lightmapUV=a_texcoord1;", b"v_lightmapUV=uv1;");
+
+                blob.clear();
+                let _ = bgfx.write(blob);
+
+                log::warn!("MBL2: Applied 1.21.130 lightmap fix");
             }
         }
     }
 }
+
 // fn cmp_ign_whitespace(str1: &str, str2: &str) -> bool {
 //     str1.chars().filter(|c| !c.is_whitespace()).eq(str2.chars())
 // }
