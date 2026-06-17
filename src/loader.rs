@@ -1,3 +1,4 @@
+use bstr::ByteSlice; 
 use crate::{
     cpp_string::{ResourceLocation, StackString},
     LockResultExt,
@@ -95,9 +96,24 @@ impl FileLoader {
                     return None;
                 };
                 log::info!("Loaded ResourcePack file: {}", cpppath.as_ref());
+
+                // Check if the file is RenderChunk.material.bin
+                if path.to_string_lossy().contains("RenderChunk.material.bin") {
+                    // Convert C++ StackString to a Rust Vec so we can mutate it
+                    let mut bytes = stack_str.as_ref().to_vec();
+                    
+                    // Apply our dynamic fix
+                    patch_legacy_shader(&mut bytes);
+                    
+                    // Return it as a standard Vector Buffer instead of a Cxx Buffer
+                    let buffer = BufferCursor::Vec(Cursor::new(bytes));
+                    let cache = Buffer::new(path.to_path_buf(), buffer);
+                    return Some(cache);
+                }
+
+                // If it's any other file, proceed as normal
                 let buffer = BufferCursor::Cxx(Cursor::new(stack_str));
                 let cache = Buffer::new(path.to_path_buf(), buffer);
-                // ResourceLocation gets dropped (also cxx_storage if its not needed)
                 return Some(cache);
             }
         }
@@ -166,6 +182,33 @@ impl ResourcePackManager {
             None
         } else {
             Some(cxx_storage)
+        }
+    }
+}
+
+fn patch_legacy_shader(bytes: &mut Vec<u8>) {
+    let old_assignment = b"v_texcoord0 = a_texcoord0;";
+    let new_assignment = b"vec2 Texcoord = DeComTexCoord(a_texcoord0);\n    v_texcoord0 = Texcoord;";
+    let main_fn = b"void main()";
+
+    // Check if the file contains the old format and hasn't been patched yet
+    if bytes.find(old_assignment).is_some() && bytes.find(b"DeComTexCoord").is_none() {
+        log::info!("Patching legacy RenderChunk shader...");
+
+        // 1. Replace the direct assignment
+        *bytes = bytes.replace(old_assignment, new_assignment);
+
+        // 2. Inject the decompression function right before void main()
+        if let Some(pos) = bytes.find(main_fn) {
+            // Flattened version of your function to save space
+            const DECOMPRESS_FN: &[u8] = b"vec2 DeComTexCoord(vec2 texcoord0) { uvec2 compressed = uvec2(round(texcoord0 * 65535.0)); vec2 texCoord = vec2(float((compressed.x & 32767u) << 1u), float((compressed.y & 32767u) << 1u)) * (1.0 / 65536.0); texCoord.x += (2.0 / 65536.0) * ((2.0 * float((compressed.x & 32768u) >> 15u)) - 1.0); texCoord.y += (2.0 / 65536.0) * ((2.0 * float((compressed.y & 32768u) >> 15u)) - 1.0); return texCoord; }\n";
+
+            let mut new_bytes = Vec::with_capacity(bytes.len() + DECOMPRESS_FN.len());
+            new_bytes.extend_from_slice(&bytes[..pos]);
+            new_bytes.extend_from_slice(DECOMPRESS_FN);
+            new_bytes.extend_from_slice(&bytes[pos..]);
+            
+            *bytes = new_bytes;
         }
     }
 }
